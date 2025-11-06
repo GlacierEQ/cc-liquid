@@ -1652,18 +1652,20 @@ def run_live_cli(
                         last_rebalance_date = datetime.now(timezone.utc)
                         trader.save_state(last_rebalance_date)
 
-                        console.input(
-                            "\n[bold green]✓ Rebalance cycle finished. Press [bold]Enter[/bold] to resume dashboard...[/bold green]"
-                        )
+                        if not skip_confirm:
+                            console.input(
+                                "\n[bold green]✓ Rebalance cycle finished. Press [bold]Enter[/bold] to resume dashboard...[/bold green]"
+                            )
 
                     except Exception as e:
                         console.print(
                             f"\n[bold red]✗ Rebalancing failed:[/bold red] {e}"
                         )
                         traceback.print_exc()
-                        console.input(
-                            "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
-                        )
+                        if not skip_confirm:
+                            console.input(
+                                "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
+                            )
                     finally:
                         # Resume the live dashboard
                         live.start()
