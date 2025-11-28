@@ -198,13 +198,13 @@ def init_cmd(non_interactive: bool):
                 {
                     "date_column": "date",
                     "asset_id_column": "symbol",
-                    "prediction_column": "meta_model",
+                    "prediction_column": "prediction",
                 }
                 if data_source == "numerai"
                 else {
                     "date_column": "release_date",
                     "asset_id_column": "id",
-                    "prediction_column": "pred_10d",
+                    "prediction_column": "pred_30d",
                 }
             ),
         },

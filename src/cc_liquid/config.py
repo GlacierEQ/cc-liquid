@@ -18,7 +18,7 @@ class DataSourceConfig:
     path: str = "predictions.parquet"
     date_column: str = "release_date"
     asset_id_column: str = "id"
-    prediction_column: str = "pred_10d"
+    prediction_column: str = "pred_30d"
 
 
 @dataclass
@@ -382,7 +382,7 @@ def _apply_data_source_defaults(overrides, applied):
         "numerai": {
             "date_column": "date",
             "asset_id_column": "symbol",
-            "prediction_column": "meta_model",
+            "prediction_column": "prediction",
         },
         "crowdcent": {
             "date_column": "release_date",

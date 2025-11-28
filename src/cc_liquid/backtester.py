@@ -41,7 +41,7 @@ class BacktestConfig:
     # Prediction columns (will be taken from DataSourceConfig in CLI)
     pred_date_column: str = "release_date"
     pred_id_column: str = "id"
-    pred_value_column: str = "pred_10d"
+    pred_value_column: str = "pred_30d"
 
     # Data provider (e.g., crowdcent, numerai, local)
     data_provider: str | None = None
@@ -360,6 +360,7 @@ class Backtester:
 
             # Calculate portfolio return using old weights (positions held from previous close)
             portfolio_return = 0.0
+            prev_equity = equity
 
             if current_weights:
                 for asset, weight in current_weights.items():
@@ -368,13 +369,8 @@ class Backtester:
                         if asset_return is not None and not math.isnan(asset_return):
                             portfolio_return += weight * asset_return
 
-            # Update equity with returns
-            equity *= 1 + portfolio_return
-
-            # Track peak and drawdown
-            if equity > peak_equity:
-                peak_equity = equity
-            drawdown = (equity - peak_equity) / peak_equity if peak_equity > 0 else 0
+            # Apply market return first
+            equity_after_return = prev_equity * (1 + portfolio_return)
 
             # Check if we need to rebalance
             turnover = 0.0
@@ -423,8 +419,8 @@ class Backtester:
                 total_cost_bps = self.config.fee_bps + self.config.slippage_bps
                 cost = turnover * (total_cost_bps / 10_000)
 
-                # Deduct rebalancing costs from equity
-                equity *= 1 - cost
+                # Deduct rebalancing costs from equity after market move
+                equity = equity_after_return * (1 - cost)
 
                 # Store position snapshot
                 for asset, weight in new_weights.items():
@@ -434,12 +430,23 @@ class Backtester:
 
                 # Update weights for next period (take effect at next close)
                 current_weights = new_weights.copy()
+            else:
+                # No rebalance; equity is just after market move
+                equity = equity_after_return
+
+            # Track peak and drawdown AFTER all effects (returns + costs)
+            if equity > peak_equity:
+                peak_equity = equity
+            drawdown = (equity - peak_equity) / peak_equity if peak_equity > 0 else 0
+
+            # Net daily return including costs
+            net_return = (equity / prev_equity) - 1.0
 
             # Store daily results
             daily_results.append(
                 {
                     "date": date,
-                    "returns": portfolio_return,
+                    "returns": net_return,
                     "equity": equity,
                     "drawdown": drawdown,
                     "turnover": turnover,
