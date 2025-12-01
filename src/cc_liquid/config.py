@@ -25,8 +25,11 @@ class DataSourceConfig:
 class RebalancingConfig:
     """Rebalancing schedule configuration."""
 
-    every_n_days: int = 10  # How often to rebalance (in days)
+    every_n_days: int = 10  # How often to rebalance (in days). Ignored in rolling mode.
     at_time: str = "18:15"  # What time to rebalance (UTC)
+    mode: str = "rolling"  # "full" (rebalance entire portfolio) or "rolling" (daily vintages)
+    rolling_days: int = 30  # Vintage lifespan in days. Match to prediction horizon.
+    seed_full: bool = True  # If true, seed with historical predictions on first run
 
 
 @dataclass

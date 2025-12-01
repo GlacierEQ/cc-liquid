@@ -542,9 +542,15 @@ def create_config_tree_table(config_dict: dict) -> Table:
             ("│  └─ Slippage", f"{slippage:.0f}%"),
         ])
     
+    # Determine frequency string based on mode
+    if rebalancing.get("mode") == "rolling":
+        freq_str = "Daily (rolling)"
+    else:
+        freq_str = f"Every {rebalancing.get('every_n_days', 10)} days"
+
     rows.extend([
         ("└─ Rebalancing", ""),
-        ("   ├─ Frequency", f"Every {rebalancing.get('every_n_days', 10)} days"),
+        ("   ├─ Frequency", freq_str),
         ("   └─ Time (UTC)", rebalancing.get("at_time", "18:15")),
         ("", ""),
         ("[bold]EXECUTION[/bold]", ""),
