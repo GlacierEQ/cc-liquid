@@ -1320,12 +1320,13 @@ class CCLiquid:
         """Get current open orders.
 
         Returns:
-            List of open orders with details like coin, size, limit price, side, etc.
+            List of open orders with details like coin, size, limit price, side,
+            orderType, isTrigger, triggerPx, etc.
         """
         owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
         if not owner:
             raise ValueError("Missing portfolio owner address")
-        return self.info.open_orders(owner)
+        return self.info.frontend_open_orders(owner)
 
     def cancel_open_orders(self, coin: str | None = None) -> dict[str, Any]:
         """Cancel open orders, optionally filtered by coin.
@@ -1415,16 +1416,8 @@ class CCLiquid:
         if not open_orders:
             return {"status": "ok", "response": "No open orders", "cancelled": 0}
         
-        # Filter for TP/SL orders - check both nested structure and direct
-        tpsl_orders = []
-        for o in open_orders:
-            order_type = o.get("orderType", {})
-            # Check if it's a trigger order (TP/SL)
-            if isinstance(order_type, dict) and "trigger" in order_type:
-                tpsl_orders.append(o)
-            # Also check string format if API returns it differently
-            elif isinstance(order_type, str) and "trigger" in order_type.lower():
-                tpsl_orders.append(o)
+        # Filter for TP/SL orders using the isTrigger field from frontend_open_orders
+        tpsl_orders = [o for o in open_orders if o.get("isTrigger")]
         
         if not tpsl_orders:
             self.callbacks.info(f"No existing TP/SL orders to cancel (found {len(open_orders)} other orders)")
