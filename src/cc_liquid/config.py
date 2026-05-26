@@ -18,15 +18,27 @@ class DataSourceConfig:
     path: str = "predictions.parquet"
     date_column: str = "release_date"
     asset_id_column: str = "id"
-    prediction_column: str = "pred_10d"
+    prediction_column: str = "pred_30d"
 
 
 @dataclass
 class RebalancingConfig:
     """Rebalancing schedule configuration."""
 
-    every_n_days: int = 10  # How often to rebalance (in days)
+    every_n_days: int = 10  # How often to rebalance (in days). Ignored in rolling mode.
     at_time: str = "18:15"  # What time to rebalance (UTC)
+    mode: str = "rolling"  # "full" (rebalance entire portfolio) or "rolling" (daily vintages)
+    rolling_days: int = 30  # Vintage lifespan in days. Match to prediction horizon.
+    seed_full: bool = True  # If true, seed with historical predictions on first run
+
+
+@dataclass
+class StopLossConfig:
+    """Stop loss protection configuration."""
+
+    sides: str = "none"  # "none", "both", "long_only", "short_only"
+    pct: float = 0.17  # 17% from entry price
+    slippage: float = 0.05  # Slippage tolerance for limit order
 
 
 @dataclass
@@ -36,15 +48,20 @@ class PortfolioConfig:
     num_long: int = 10
     num_short: int = 10
     target_leverage: float = 1.0  # Position sizing multiplier (1.0 = no leverage)
+    rank_power: float = 0.0  # 0.0 = equal weight (default), higher = more concentration
     rebalancing: RebalancingConfig = field(default_factory=RebalancingConfig)
+    stop_loss: StopLossConfig = field(default_factory=StopLossConfig)
 
 
 @dataclass
 class ExecutionConfig:
     """Order execution parameters."""
 
-    slippage_tolerance: float = 0.005
+    slippage_tolerance: float = 0.005  # Market orders: aggressive (away from mid)
+    limit_price_offset: float = 0.0  # Limit orders: passive offset (0.0 = exact mid, >0 = inside mid)
     min_trade_value: float = 10.0  # Exchange minimum order notional in USD
+    order_type: str = "market"  # "market" or "limit"
+    time_in_force: str = "Ioc"  # "Ioc" (Immediate or Cancel), "Gtc" (Good til Canceled), "Alo" (Add Liquidity Only)
 
 
 @dataclass
@@ -198,12 +215,26 @@ class Config:
                 f"Private key not found. Set '{signer_env}' in your .env file."
             )
 
+        # Validate order type
+        if self.execution.order_type not in ("market", "limit"):
+            raise ValueError(
+                f"Invalid order_type: {self.execution.order_type}. Must be 'market' or 'limit'"
+            )
+
+        # Validate time in force
+        if self.execution.time_in_force not in ("Ioc", "Gtc", "Alo"):
+            raise ValueError(
+                f"Invalid time_in_force: {self.execution.time_in_force}. Must be 'Ioc', 'Gtc', or 'Alo'"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the config."""
         portfolio_dict = self.portfolio.__dict__.copy()
-        # Convert nested dataclass to dict
+        # Convert nested dataclasses to dict
         if hasattr(self.portfolio, "rebalancing"):
             portfolio_dict["rebalancing"] = self.portfolio.rebalancing.__dict__
+        if hasattr(self.portfolio, "stop_loss"):
+            portfolio_dict["stop_loss"] = self.portfolio.stop_loss.__dict__
 
         # Profile summary (non-secret)
         active_profile = self.active_profile
@@ -354,7 +385,7 @@ def _apply_data_source_defaults(overrides, applied):
         "numerai": {
             "date_column": "date",
             "asset_id_column": "symbol",
-            "prediction_column": "meta_model",
+            "prediction_column": "prediction",
         },
         "crowdcent": {
             "date_column": "release_date",

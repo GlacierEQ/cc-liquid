@@ -43,13 +43,55 @@ This shows your current portfolio state:
 
 !!! warning
     Errors on this step are most often due to incrorrectly configured/loaded private keys. You may need to ensure your .env is loaded by running:
+    
+    ```bash
+    export UV_ENV_FILE=.env
+    ```
+    OR
+
     ```bash
     export $(grep -v '^#' .env | xargs)
     ```
 
     This command reads your `.env` file, filters out comments, and exports the variables. You'll need to run it in each new terminal session.
 
-## 4) Plan and execute rebalancing
+## 4) Backtest before going live
+
+!!! warning "Backtesting Limitations"
+    Remember that backtesting has inherent limitations. Past performance does not guarantee future results. Results are hypothetical and may not account for all real-world factors. Historical data and simulations may contain inaccuracies. Always validate with paper trading before using real capital.
+
+!!! important "Data Required"
+    You need to provide your own historical data files for backtesting:
+    - `raw_data.parquet` - Historical price data
+    - `predictions.parquet` - Your prediction signals
+    
+    See the [Backtesting documentation](backtesting.md#data-requirements) for detailed format requirements.
+
+Before trading with real funds, test your strategy on historical data:
+
+```bash
+# Ensure you have prepared the required data files first
+cc-liquid analyze
+```
+
+![backtest results](images/backtest-results.png)
+
+Find optimal parameters:
+
+```bash
+# Grid search optimization
+cc-liquid optimize
+```
+
+![optimization results](images/optimization-results.png)
+
+The optimizer tests combinations of:
+
+- Position counts (long/short)
+- Leverage levels
+- Rebalance frequencies
+
+## 5) Plan and execute rebalancing
 
 ```bash
 cc-liquid rebalance
@@ -101,7 +143,8 @@ cc-liquid rebalance --set portfolio.num_long=12 --set portfolio.num_short=8 --se
 
 5. **Execute orders**
 
-    - Places market orders with configured `slippage_tolerance`
+    - Market orders: uses `slippage_tolerance` for aggressive pricing (away from mid)
+    - Limit orders: uses `limit_price_offset` for passive pricing (at or inside mid)
     - Reports fills, failures, and actual slippage
 
 After execution completes:

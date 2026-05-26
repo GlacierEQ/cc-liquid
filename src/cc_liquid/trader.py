@@ -19,6 +19,7 @@ from hyperliquid.info import Info
 from .callbacks import CCLiquidCallbacks, NoOpCallbacks
 from .config import Config
 from .data_loader import DataLoader
+from .portfolio import weights_from_ranks
 
 logging.basicConfig(level=logging.INFO)
 
@@ -299,7 +300,7 @@ class CCLiquid:
         return round(size, sz_decimals), sz_decimals
 
     def _round_price_perp(self, coin: str, px: float) -> float:
-        """Round price according to Hyperliquid perp rules (not used for market orders).
+        """Round price according to Hyperliquid perp rules (used for limit orders).
 
         Rules (per Hyperliquid):
         - If px > 100_000: round to integer.
@@ -317,6 +318,12 @@ class CCLiquid:
 
     def plan_rebalance(self, predictions: pl.DataFrame | None = None) -> dict:
         """Compute a rebalancing plan without executing orders."""
+        # Check for open orders (warning if present)
+        open_orders = self.get_open_orders()
+        if open_orders:
+            self.callbacks.warn(
+                f"Found {len(open_orders)} open order(s). These may conflict with rebalancing."
+            )
         # Load predictions if not provided
         if predictions is None:
             self.callbacks.info("Loading predictions...")
@@ -330,6 +337,7 @@ class CCLiquid:
                     "skipped_trades": [],
                     "account_value": 0.0,
                     "leverage": self.config.portfolio.target_leverage,
+                    "open_orders": open_orders,
                 }
 
             # Display prediction info
@@ -355,7 +363,14 @@ class CCLiquid:
             "skipped_trades": skipped_trades,
             "account_value": account_value,
             "leverage": leverage,
+            "open_orders": open_orders,
         }
+
+    def plan_rebalance_auto(self, predictions: pl.DataFrame | None = None) -> dict:
+        """Plan rebalance using configured mode (full or rolling)."""
+        if self.config.portfolio.rebalancing.mode == "rolling":
+            return self.plan_rolling_rebalance(predictions)
+        return self.plan_rebalance(predictions)
 
     def execute_plan(self, plan: dict) -> dict:
         """Execute a precomputed plan, returning structured results."""
@@ -369,7 +384,32 @@ class CCLiquid:
 
         self.callbacks.info(f"Starting execution of {len(trades)} trades...")
         successful_trades = self._execute_trades(trades)
-        return {"successful_trades": successful_trades, "all_trades": trades}
+        
+        # Apply stop losses after execution
+        sl_result = None
+        if self.config.portfolio.stop_loss.sides != "none":
+            self.callbacks.info("Applying stop losses to positions...")
+            sl_result = self.apply_stop_losses()
+            
+            # Report SL results
+            if sl_result.get("status") == "ok":
+                applied_count = sl_result.get("total_applied", 0)
+                if applied_count > 0:
+                    self.callbacks.info(f"✓ Placed {applied_count} stop loss order(s)")
+                
+                # Warn about resting orders
+                resting = [t for t in successful_trades if t.get("resting")]
+                if resting:
+                    self.callbacks.warn(
+                        f"{len(resting)} order(s) resting on book. "
+                        "Run 'cc-liquid apply-stops' after they fill to add protection."
+                    )
+        
+        return {
+            "successful_trades": successful_trades,
+            "all_trades": trades,
+            "stop_loss_result": sl_result
+        }
 
     def plan_close_all_positions(self, *, force: bool = False) -> dict:
         """Plan to close all open positions (return to cash) without executing orders."""
@@ -403,49 +443,94 @@ class CCLiquid:
             "leverage": leverage,
         }
 
-    def _get_target_positions(self, predictions: pl.DataFrame) -> dict[str, float]:
-        """Calculates the target notional value for each position using equal weighting."""
+    def _get_target_positions(
+        self,
+        predictions: pl.DataFrame,
+        *,
+        override_num_long: int | None = None,
+        override_num_short: int | None = None,
+        override_leverage: float | None = None,
+        quiet: bool = False,
+    ) -> dict[str, float]:
+        """Calculate target notionals using configurable weighting scheme.
+
+        Args:
+            predictions: DataFrame with predictions
+            override_num_long: Override config num_long (for rolling mode)
+            override_num_short: Override config num_short (for rolling mode)
+            override_leverage: Override config target_leverage (for rolling mode)
+            quiet: If True, suppress info callbacks (for rolling mode)
+
+        Returns:
+            Dict mapping asset to target USD notional (signed: positive=long, negative=short)
+        """
         latest_predictions = self._get_latest_predictions(predictions)
-        long_assets = self._select_assets(latest_predictions, descending=True)
-        short_assets = self._select_assets(latest_predictions, descending=False)
+        tradeable_predictions = self._filter_tradeable_predictions(latest_predictions)
+
+        if tradeable_predictions.height == 0:
+            return {}
+
+        id_col = self.config.data.asset_id_column
+        pred_col = self.config.data.prediction_column
+
+        sorted_preds = tradeable_predictions.sort(pred_col, descending=True)
+
+        num_long = override_num_long if override_num_long is not None else self.config.portfolio.num_long
+        num_short = override_num_short if override_num_short is not None else self.config.portfolio.num_short
+
+        if sorted_preds.height < num_long + num_short and not quiet:
+            self.callbacks.warn(
+                f"Limited tradeable assets: {sorted_preds.height} available; "
+                f"requested {num_long} longs and {num_short} shorts"
+            )
+
+        long_assets = sorted_preds.head(num_long)[id_col].to_list()
+        short_assets = (
+            sorted_preds.sort(pred_col, descending=False)
+            .head(num_short)[id_col]
+            .to_list()
+            if num_short > 0
+            else []
+        )
 
         account_value = self.get_account_value()
-        total_positions = (
-            self.config.portfolio.num_long + self.config.portfolio.num_short
+        target_leverage = override_leverage if override_leverage is not None else self.config.portfolio.target_leverage
+        total_positions = len(long_assets) + len(short_assets)
+
+        if total_positions == 0 or account_value <= 0 or target_leverage <= 0:
+            return {}
+
+        if not quiet:
+            self.callbacks.info(
+                f"Target gross leverage: {target_leverage:.2f}x across {total_positions} positions"
+            )
+
+        weights = weights_from_ranks(
+            latest_preds=tradeable_predictions.select([id_col, pred_col]),
+            id_col=id_col,
+            pred_col=pred_col,
+            long_assets=long_assets,
+            short_assets=short_assets,
+            target_gross=target_leverage,
+            power=self.config.portfolio.rank_power,
         )
 
-        # When using leverage, we can allocate more notional value per position
-        # This effectively creates leveraged positions by sizing them larger than account equity
-        target_leverage = self.config.portfolio.target_leverage
-        position_value = (account_value * target_leverage) / total_positions
+        target_positions = {
+            asset: weight * account_value for asset, weight in weights.items()
+        }
 
-        # Log the calculation for transparency
-        self.callbacks.info(
-            f"Position sizing: ${account_value:.2f} × {target_leverage}x leverage "
-            f"÷ {total_positions} positions = ${position_value:.2f} per position"
-        )
-
-        # Warn if position sizes will be too small
-        min_position_value = self.config.execution.min_trade_value
-        if position_value < min_position_value:
-            msg = "Warning: Position size too small!\n"
-            msg += f"   Account value: ${account_value:.2f}\n"
-            if target_leverage > 1.0:
-                msg += f"   With {target_leverage}x leverage: ${account_value * target_leverage:.2f} total exposure\n"
-            msg += f"   Divided by {total_positions} positions = ${position_value:.2f} per position\n"
-            msg += f"   Minimum required: ${min_position_value}\n\n"
-            msg += "   Solutions:\n"
-            msg += f"   • Reduce positions (currently {self.config.portfolio.num_long} long + {self.config.portfolio.num_short} short)\n"
-            msg += "   • Increase account value\n"
-            if target_leverage < 5.0:
-                msg += f"   • Increase leverage (currently {target_leverage}x)\n"
-            self.callbacks.warn(msg)
-
-        target_positions = {}
-        for asset in long_assets:
-            target_positions[asset] = position_value
-        for asset in short_assets:
-            target_positions[asset] = -position_value
+        # Warn if resulting notionals fall below exchange minimums
+        min_notional = self.config.execution.min_trade_value
+        undersized = [
+            asset
+            for asset, weight in target_positions.items()
+            if abs(weight) < min_notional
+        ]
+        if undersized and not quiet:
+            self.callbacks.warn(
+                "Some target positions fall below minimum notional: "
+                + ", ".join(sorted(undersized))
+            )
 
         return target_positions
 
@@ -457,22 +542,19 @@ class CCLiquid:
             .first()
         )
 
-    def _select_assets(self, predictions: pl.DataFrame, descending: bool) -> list[str]:
-        """Selects top or bottom N assets based on prediction score,
-        filtered to only assets currently listed on Hyperliquid."""
+    def _filter_tradeable_predictions(self, predictions: pl.DataFrame) -> pl.DataFrame:
+        """Filter predictions to Hyperliquid-listed assets."""
 
-        # Use listed assets from /info meta
         universe = self.info.meta()["universe"]
         available_assets = {
             p["name"] for p in universe if not p.get("isDelisted", False)
         }
 
-        # Filter predictions to only tradeable assets
-        tradeable_predictions = predictions.filter(
+        tradeable = predictions.filter(
             pl.col(self.config.data.asset_id_column).is_in(available_assets)
         )
 
-        if tradeable_predictions.height == 0:
+        if tradeable.height == 0:
             self.logger.warning("No predictions match Hyperliquid tradeable assets!")
             self.callbacks.error(
                 "Error: No predictions match Hyperliquid tradeable assets!"
@@ -486,33 +568,8 @@ class CCLiquid:
             self.callbacks.info(
                 f"In predictions: {sorted(prediction_assets[:10])}{'...' if len(prediction_assets) > 10 else ''}"
             )
-            return []
 
-        # Select from filtered set
-        num_assets = (
-            self.config.portfolio.num_long
-            if descending
-            else self.config.portfolio.num_short
-        )
-
-        # Warn if we don't have enough tradeable assets
-        if tradeable_predictions.height < num_assets:
-            self.callbacks.warn(
-                f"Warning: Only {tradeable_predictions.height} tradeable assets available, requested {num_assets}"
-            )
-            self.callbacks.info(
-                f"Will use all {tradeable_predictions.height} available assets"
-            )
-
-        selected = (
-            tradeable_predictions.sort(
-                self.config.data.prediction_column, descending=descending
-            )
-            .head(num_assets)[self.config.data.asset_id_column]
-            .to_list()
-        )
-
-        return selected
+        return tradeable
 
     def _calculate_trades(
         self,
@@ -529,6 +586,10 @@ class CCLiquid:
         trades = []
         skipped_trades = []  # Track trades we can't execute
         all_mids = self.info.all_mids()
+        
+
+        fee_info = self.get_fee_summary()
+        taker_rate = float(fee_info.get("userCrossRate", 0.00035))
 
         all_assets = set(target_positions.keys()) | set(current_positions.keys())
 
@@ -624,6 +685,7 @@ class CCLiquid:
                 "target_value": target_value,
                 "delta_value": delta_value,
                 "type": trade_type,
+                "estimated_fee": abs(delta_value) * taker_rate,
             }
 
             # Re-evaluate min notional AFTER rounding size
@@ -635,7 +697,7 @@ class CCLiquid:
                     skipped_trades.append(trade_data)
                 else:
                     forced, reason = self._compose_force_close_trades(
-                        asset, price, current_value, min_trade_value
+                        asset, price, current_value, min_trade_value, taker_rate
                     )
                     if forced is None:
                         skipped_trades.append(
@@ -673,7 +735,7 @@ class CCLiquid:
         return sorted(trades, key=sort_key)
 
     def _compose_force_close_trades(
-        self, coin: str, price: float, current_value: float, min_trade_value: float
+        self, coin: str, price: float, current_value: float, min_trade_value: float, taker_rate: float
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Compose the two-step forced close for sub-minimum closes.
         i.e. if we have a position of less than $10, we want to close it to $0, we need to increase the position
@@ -688,6 +750,8 @@ class CCLiquid:
 
         increase_is_buy = current_value > 0
         force_id = f"force_close:{coin}"
+        
+        step1_delta = min_increase_sz * price if increase_is_buy else -(min_increase_sz * price)
 
         step1 = {
             "coin": coin,
@@ -701,13 +765,12 @@ class CCLiquid:
                 if current_value >= 0
                 else -min_increase_sz * price
             ),
-            "delta_value": min_increase_sz * price
-            if increase_is_buy
-            else -(min_increase_sz * price),
+            "delta_value": step1_delta,
             "type": "increase",
             "force": True,
             "force_id": force_id,
             "force_seq": 0,
+            "estimated_fee": abs(step1_delta) * taker_rate,
         }
 
         total_notional_to_close = abs(current_value) + (min_increase_sz * price)
@@ -716,6 +779,8 @@ class CCLiquid:
         if close_sz_rounded is None:
             return None, "Unknown szDecimals (meta)"
         close_sz, _ = close_sz_rounded
+        
+        step2_delta = total_notional_to_close if close_is_buy else -total_notional_to_close
 
         step2 = {
             "coin": coin,
@@ -729,13 +794,12 @@ class CCLiquid:
                 else -(min_increase_sz * price)
             ),
             "target_value": 0,
-            "delta_value": total_notional_to_close
-            if close_is_buy
-            else -total_notional_to_close,
+            "delta_value": step2_delta,
             "type": "close",
             "force": True,
             "force_id": force_id,
             "force_seq": 1,
+            "estimated_fee": abs(step2_delta) * taker_rate,
         }
 
         # Ensure both meet minimum notional
@@ -771,7 +835,7 @@ class CCLiquid:
         return rounded_up_size, sz_decimals
 
     def _execute_trades(self, trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Executes a list of trades using the SDK's market_open for robustness."""
+        """Executes a list of trades sequentially with configurable order type and time-in-force."""
         if not trades:
             return []
 
@@ -787,28 +851,66 @@ class CCLiquid:
 
             try:
                 self.logger.debug(f"Executing trade: {trade}")
-                # Pass vault address if trading on behalf of a vault/subaccount.
-                result = self.exchange.market_open(
-                    name=trade["coin"],
-                    is_buy=trade["is_buy"],
-                    sz=trade["sz"],  # Already a float
-                    slippage=self.config.execution.slippage_tolerance,
-                )
+                
+                coin = trade["coin"]
+                is_buy = trade["is_buy"]
+                size = trade["sz"]
+                
+                # Determine limit price based on order_type
+                if self.config.execution.order_type == "limit":
+                    # Use passive pricing: buy below mid, sell above mid
+                    mid_price = float(self.info.all_mids()[coin])
+                    offset = self.config.execution.limit_price_offset
+                    
+                    if is_buy:
+                        limit_px = self._round_price_perp(coin, mid_price * (1 - offset))
+                    else:
+                        limit_px = self._round_price_perp(coin, mid_price * (1 + offset))
+                else:  # market
+                    # Use slippage price (aggressive) for market orders
+                    limit_px = self.exchange._slippage_price(
+                        coin, is_buy, self.config.execution.slippage_tolerance
+                    )
+                
+                # Build single order request
+                order_request = {
+                    "coin": coin,
+                    "is_buy": is_buy,
+                    "sz": size,
+                    "limit_px": limit_px,
+                    "order_type": {"limit": {"tif": self.config.execution.time_in_force}},
+                    "reduce_only": False,
+                }
+                
+                # Execute single order via bulk_orders with single-item list
+                result = self.exchange.bulk_orders([order_request])
 
-                statuses = (
-                    result.get("response", {}).get("data", {}).get("statuses", [])
-                )
+                # Handle error responses
+                if result.get("status") == "err":
+                    error_msg = result.get("response", "Unknown error")
+                    self.callbacks.on_trade_fail(trade, error_msg)
+                    failed_trades.append(trade)
+                    continue
+
+                # Handle success responses
+                response = result.get("response", {})
+                if not isinstance(response, dict):
+                    self.callbacks.on_trade_fail(trade, f"Unexpected response format: {response}")
+                    failed_trades.append(trade)
+                    continue
+
+                statuses = response.get("data", {}).get("statuses", [])
+                
+                if not statuses:
+                    self.callbacks.on_trade_fail(trade, "No status returned")
+                    failed_trades.append(trade)
+                    continue
+                
+                status = statuses[0]  # Get first (and only) status
 
                 # Check for filled orders
-                filled_data = None
-                for status in statuses:
-                    if "filled" in status:
-                        filled_data = status["filled"]
-                        break
-
-                if filled_data:
-                    # Extract fill details
-                    float(filled_data.get("totalSz", trade["sz"]))
+                if "filled" in status:
+                    filled_data = status["filled"]
                     avg_px = float(filled_data.get("avgPx", trade["price"]))
 
                     # Calculate slippage
@@ -821,6 +923,9 @@ class CCLiquid:
                             (trade["price"] - avg_px) / trade["price"]
                         ) * 100
 
+                    # Extract actual fee from API response
+                    actual_fee = float(filled_data.get("fee", 0))
+
                     self.callbacks.on_trade_fill(trade, filled_data, slippage_pct)
 
                     successful_trades.append(
@@ -828,12 +933,37 @@ class CCLiquid:
                             **trade,
                             "fill_data": filled_data,
                             "slippage_pct": slippage_pct,
+                            "actual_fee": actual_fee,
+                            "status": "filled",
                         }
                     )
+                
+                # Check for resting orders (Gtc/Alo orders posted to book)
+                elif "resting" in status and self.config.execution.time_in_force in ("Gtc", "Alo"):
+                    resting_data = status["resting"]
+                    oid = resting_data.get("oid")
+                    
+                    # This is a success for Gtc/Alo - order is on the book
+                    self.callbacks.info(
+                        f"  {trade['coin']}: Order posted to book (OID: {oid}). "
+                        f"Check with 'cc-liquid orders'"
+                    )
+
+                    successful_trades.append(
+                        {
+                            **trade,
+                            "resting": True,
+                            "oid": oid,
+                            "status": "resting",
+                        }
+                    )
+                
+                # Handle errors or actual failures
                 else:
-                    # Handle errors or unfilled orders
-                    errors = [s.get("error") for s in statuses if "error" in s]
-                    error_msg = errors[0] if errors else "Order not filled"
+                    if "error" in status:
+                        error_msg = status["error"]
+                    else:
+                        error_msg = "Order rejected or not filled"
 
                     self.callbacks.on_trade_fail(trade, error_msg)
                     failed_trades.append(trade)
@@ -879,7 +1009,9 @@ class CCLiquid:
             )
             return today_at if now_utc < today_at else now_utc
 
-        next_date = last_rebalance_date.date() + timedelta(days=cfg.every_n_days)
+        # Rolling mode = daily; full mode = every_n_days
+        interval = 1 if cfg.mode == "rolling" else cfg.every_n_days
+        next_date = last_rebalance_date.date() + timedelta(days=interval)
         return datetime.combine(next_date, rebalance_time, tzinfo=timezone.utc)
 
     def _load_state(self) -> datetime | None:
@@ -905,8 +1037,576 @@ class CCLiquid:
         import json
 
         state_file = ".cc_liquid_state.json"
+        # Preserve existing vintages when saving
+        existing_vintages = self._load_vintages()
+        state = {"last_rebalance_date": last_rebalance_date.isoformat()}
+        if existing_vintages:
+            state["vintages"] = existing_vintages
         with open(state_file, "w") as f:
-            json.dump({"last_rebalance_date": last_rebalance_date.isoformat()}, f)
+            json.dump(state, f)
+
+    def _load_vintages(self) -> dict[str, dict[str, float]]:
+        """Load vintages from state file.
+
+        Returns:
+            Dict mapping date string (YYYY-MM-DD) to {asset: units} dict.
+            Units are signed: positive=long, negative=short.
+        """
+        import json
+        import os
+
+        state_file = ".cc_liquid_state.json"
+        if not os.path.exists(state_file):
+            return {}
+
+        try:
+            with open(state_file) as f:
+                state = json.load(f)
+                return state.get("vintages", {})
+        except Exception as e:
+            self.logger.warning(f"Could not load vintages from state: {e}")
+            return {}
+
+    def _save_vintages(self, vintages: dict[str, dict[str, float]]) -> None:
+        """Save vintages to state file, preserving other state."""
+        import json
+        import os
+
+        state_file = ".cc_liquid_state.json"
+
+        # Load existing state to preserve other fields
+        existing_state = {}
+        if os.path.exists(state_file):
+            try:
+                with open(state_file) as f:
+                    existing_state = json.load(f)
+            except Exception:
+                pass
+
+        existing_state["vintages"] = vintages
+        with open(state_file, "w") as f:
+            json.dump(existing_state, f)
+
+    def _prune_expired_vintages(
+        self, vintages: dict[str, dict[str, float]], today: datetime, rolling_days: int
+    ) -> dict[str, dict[str, float]]:
+        """Remove vintages older than rolling_days."""
+        from datetime import date as date_type
+
+        if isinstance(today, datetime):
+            today_date = today.date()
+        else:
+            today_date = today
+
+        cutoff = today_date - timedelta(days=rolling_days)
+
+        pruned = {}
+        for date_str, positions in vintages.items():
+            vintage_date = date_type.fromisoformat(date_str)
+            if vintage_date > cutoff:
+                pruned[date_str] = positions
+
+        return pruned
+
+    def plan_rolling_rebalance(self, predictions: pl.DataFrame | None = None) -> dict:
+        """Compute a rolling rebalance plan using vintage-based position management.
+
+        In rolling mode:
+        - Each day creates a "vintage" with 1/N of target allocation
+        - Vintages expire after rolling_days
+        - Final portfolio = sum of all active vintage positions
+        - Trade = diff between target sum and current positions
+
+        Returns:
+            Plan dict compatible with execute_plan()
+        """
+        rolling_days = self.config.portfolio.rebalancing.rolling_days
+        seed_full = self.config.portfolio.rebalancing.seed_full
+        today = datetime.now(timezone.utc)
+        today_str = today.date().isoformat()
+
+        # Check for open orders (warning if present)
+        open_orders = self.get_open_orders()
+        if open_orders:
+            self.callbacks.warn(
+                f"Found {len(open_orders)} open order(s). These may conflict with rebalancing."
+            )
+
+        # Load predictions if not provided
+        if predictions is None:
+            self.callbacks.info("Loading predictions...")
+            predictions = self._load_predictions()
+
+            if predictions is None or predictions.is_empty():
+                self.callbacks.error("No predictions available, cannot rebalance")
+                return {
+                    "target_positions": {},
+                    "trades": [],
+                    "skipped_trades": [],
+                    "account_value": 0.0,
+                    "leverage": self.config.portfolio.target_leverage,
+                    "open_orders": open_orders,
+                    "vintages": {},
+                }
+
+        # Load and prune existing vintages
+        vintages = self._load_vintages()
+        vintages = self._prune_expired_vintages(vintages, today, rolling_days)
+
+        # If no vintages and seed_full enabled, seed from historical predictions
+        if not vintages and seed_full:
+            self.callbacks.info(f"Seeding {rolling_days} vintages from historical predictions...")
+            vintages = self._seed_vintages_from_history(predictions, today, rolling_days)
+        else:
+            # Create today's vintage (if not already created today)
+            if today_str not in vintages:
+                self.callbacks.info(f"Creating vintage for {today_str}...")
+                new_vintage = self._create_daily_vintage(predictions, rolling_days)
+                if new_vintage:
+                    vintages[today_str] = new_vintage
+
+        # Aggregate all vintages to get global target (in units)
+        global_target_units = self._aggregate_vintages(vintages)
+
+        # Convert to USD for trade calculation
+        all_mids = self.info.all_mids()
+        global_target_usd = {}
+        for coin, units in global_target_units.items():
+            if coin in all_mids:
+                price = float(all_mids[coin])
+                global_target_usd[coin] = units * price
+
+        # Get current positions and calculate trades
+        current_positions = self.get_positions()
+        trades, skipped_trades = self._calculate_trades(global_target_usd, current_positions)
+
+        # Save updated vintages
+        self._save_vintages(vintages)
+
+        account_value = self.get_account_value()
+        return {
+            "target_positions": global_target_usd,
+            "trades": trades,
+            "skipped_trades": skipped_trades,
+            "account_value": account_value,
+            "leverage": self.config.portfolio.target_leverage,
+            "open_orders": open_orders,
+            "vintages": vintages,
+            "active_vintage_count": len(vintages),
+        }
+
+    def _create_daily_vintage(
+        self, predictions: pl.DataFrame, rolling_days: int
+    ) -> dict[str, float]:
+        """Create a single vintage from today's predictions.
+
+        Returns:
+            Dict mapping asset to signed units (positive=long, negative=short)
+        """
+        # Scale parameters for single vintage
+        # Note: We do NOT scale num_long/num_short. Each vintage should be a slice of the FULL strategy.
+        # If full strategy wants top 10, each vintage should buy 1/30th of the top 10.
+        scaled_leverage = self.config.portfolio.target_leverage / rolling_days
+        
+        # Get target USD values using scaled leverage but FULL counts
+        vintage_targets_usd = self._get_target_positions(
+            predictions,
+            override_leverage=scaled_leverage,
+            quiet=True,
+        )
+
+        if not vintage_targets_usd:
+            return {}
+
+        # Convert USD to units for storage
+        all_mids = self.info.all_mids()
+        vintage_units = {}
+        for coin, usd_val in vintage_targets_usd.items():
+            if coin in all_mids:
+                price = float(all_mids[coin])
+                if price > 0:
+                    vintage_units[coin] = usd_val / price
+
+        return vintage_units
+
+    def _seed_vintages_from_history(
+        self, predictions: pl.DataFrame, today: datetime, rolling_days: int
+    ) -> dict[str, dict[str, float]]:
+        """Create N vintages from historical predictions for immediate full deployment.
+
+        This provides time-diversification from day 1 instead of gradual ramp-up.
+        """
+        date_col = self.config.data.date_column
+        today_date = today.date()
+
+        # Get unique prediction dates, sorted descending
+        pred_dates = (
+            predictions.select(pl.col(date_col).dt.date().alias("pred_date"))
+            .unique()
+            .sort("pred_date", descending=True)
+        )
+        available_dates = pred_dates["pred_date"].to_list()
+
+        vintages = {}
+
+        for i in range(min(rolling_days, len(available_dates))):
+            # Synthetic vintage date: stagger backwards from today
+            vintage_date = today_date - timedelta(days=i)
+            vintage_date_str = vintage_date.isoformat()
+
+            # Get predictions from this historical date
+            pred_date = available_dates[i]
+            day_preds = predictions.filter(
+                pl.col(date_col).dt.date() == pred_date
+            )
+
+            if day_preds.is_empty():
+                continue
+
+            # Create vintage for this day
+            vintage = self._create_daily_vintage(day_preds, rolling_days)
+            if vintage:
+                vintages[vintage_date_str] = vintage
+                self.callbacks.info(f"  Seeded vintage {vintage_date_str} from {pred_date}")
+
+        self.callbacks.info(f"Seeded {len(vintages)} vintages")
+        return vintages
+
+    def _aggregate_vintages(
+        self, vintages: dict[str, dict[str, float]]
+    ) -> dict[str, float]:
+        """Sum all vintage positions to get global target in units."""
+        global_target = {}
+        for vintage in vintages.values():
+            for coin, units in vintage.items():
+                global_target[coin] = global_target.get(coin, 0.0) + units
+        return global_target
+
+    def get_vintages_summary(self) -> list[dict[str, Any]]:
+        """Get summary of active vintages for display."""
+        vintages = self._load_vintages()
+        if not vintages:
+            return []
+
+        all_mids = self.info.all_mids()
+        today = datetime.now(timezone.utc).date()
+        rolling_days = self.config.portfolio.rebalancing.rolling_days
+
+        summary = []
+        for date_str, positions in sorted(vintages.items()):
+            from datetime import date as date_type
+            vintage_date = date_type.fromisoformat(date_str)
+            age = (today - vintage_date).days
+            expires_in = rolling_days - age
+
+            # Calculate vintage value
+            total_value = 0.0
+            for coin, units in positions.items():
+                if coin in all_mids:
+                    price = float(all_mids[coin])
+                    total_value += abs(units * price)
+
+            summary.append({
+                "date": date_str,
+                "age_days": age,
+                "expires_in_days": expires_in,
+                "num_positions": len(positions),
+                "value_usd": total_value,
+            })
+
+        return summary
+
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        """Get current open orders.
+
+        Returns:
+            List of open orders with details like coin, size, limit price, side,
+            orderType, isTrigger, triggerPx, etc.
+        """
+        owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
+        if not owner:
+            raise ValueError("Missing portfolio owner address")
+        return self.info.frontend_open_orders(owner)
+
+    def cancel_open_orders(self, coin: str | None = None) -> dict[str, Any]:
+        """Cancel open orders, optionally filtered by coin.
+
+        Args:
+            coin: If provided, only cancel orders for this coin. If None, cancel all.
+
+        Returns:
+            Result of the cancel operation
+        """
+        open_orders = self.get_open_orders()
+
+        if not open_orders:
+            return {"status": "ok", "response": "No open orders to cancel"}
+
+        # Filter by coin if specified
+        if coin:
+            orders_to_cancel = [o for o in open_orders if o["coin"] == coin]
+        else:
+            orders_to_cancel = open_orders
+
+        if not orders_to_cancel:
+            return {
+                "status": "ok",
+                "response": f"No open orders found for {coin}" if coin else "No orders to cancel",
+            }
+
+        # Build cancel requests
+        cancel_requests = [
+            {"coin": order["coin"], "oid": order["oid"]} for order in orders_to_cancel
+        ]
+
+        # Execute bulk cancel
+        self.logger.info(f"Cancelling {len(cancel_requests)} open orders...")
+        result = self.exchange.bulk_cancel(cancel_requests)
+
+        return result
+
+    def get_fill_history(
+        self, start_time: int | None = None, end_time: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Get fill history with optional time range.
+
+        Args:
+            start_time: Unix timestamp in milliseconds (optional)
+            end_time: Unix timestamp in milliseconds (optional)
+
+        Returns:
+            List of fills with execution details, prices, sizes, and fees
+        """
+        owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
+        if not owner:
+            raise ValueError("Missing portfolio owner address")
+
+        if start_time is not None:
+            return self.info.user_fills_by_time(owner, start_time, end_time)
+        return self.info.user_fills(owner)
+
+    def get_fee_summary(self) -> dict[str, Any]:
+        """Get fee rates and trading volume statistics.
+
+        Returns:
+            Dictionary containing fee rates (maker/taker), volume stats, and fee schedule
+        """
+        owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
+        if not owner:
+            raise ValueError("Missing portfolio owner address")
+        return self.info.user_fees(owner)
+
+    def _should_apply_stop_loss(self, side: str) -> bool:
+        """Check if stop loss should be applied to a position side."""
+        sides_config = self.config.portfolio.stop_loss.sides
+        if sides_config == "none":
+            return False
+        if sides_config == "both":
+            return True
+        if sides_config == "long_only" and side == "LONG":
+            return True
+        if sides_config == "short_only" and side == "SHORT":
+            return True
+        return False
+
+    def cancel_all_tpsl_orders(self) -> dict[str, Any]:
+        """Cancel all existing TP/SL orders across the portfolio."""
+        open_orders = self.get_open_orders()
+        
+        if not open_orders:
+            return {"status": "ok", "response": "No open orders", "cancelled": 0}
+        
+        # Filter for TP/SL orders using the isTrigger field from frontend_open_orders
+        tpsl_orders = [o for o in open_orders if o.get("isTrigger")]
+        
+        if not tpsl_orders:
+            self.callbacks.info(f"No existing TP/SL orders to cancel (found {len(open_orders)} other orders)")
+            return {"status": "ok", "response": "No TP/SL orders to cancel", "cancelled": 0}
+        
+        cancel_requests = [
+            {"coin": order["coin"], "oid": order["oid"]} 
+            for order in tpsl_orders
+        ]
+        
+        self.callbacks.info(f"Cancelling {len(cancel_requests)} existing TP/SL order(s)...")
+        result = self.exchange.bulk_cancel(cancel_requests)
+        result["cancelled"] = len(cancel_requests)
+        return result
+
+    def apply_stop_losses(self) -> dict[str, Any]:
+        """Apply stop losses to all current open positions per config.
+        
+        Returns:
+            Dict with counts of applied/skipped SLs and any errors
+        """
+        if self.config.portfolio.stop_loss.sides == "none":
+            return {
+                "status": "disabled",
+                "message": "Stop losses disabled in config (stop_loss.sides=none)"
+            }
+        
+        # Get current positions
+        positions = self.get_positions()
+        if not positions:
+            return {
+                "status": "ok",
+                "applied": 0,
+                "message": "No open positions to protect"
+            }
+        
+        # Cancel existing TP/SL orders first
+        self.cancel_all_tpsl_orders()
+        
+        # Get current prices
+        all_mids = self.info.all_mids()
+        
+        applied = []
+        skipped = []
+        errors = []
+        
+        # Count eligible positions first for progress tracking
+        eligible_positions = []
+        for coin, position in positions.items():
+            size = float(position.get("szi", 0))
+            if size == 0:
+                continue
+            side = "LONG" if size > 0 else "SHORT"
+            if self._should_apply_stop_loss(side):
+                eligible_positions.append(coin)
+        
+        total_eligible = len(eligible_positions)
+        
+        # Build all SL orders first
+        orders_to_place = []
+        order_metadata = []  # Track metadata for each order
+        
+        for coin, position in positions.items():
+            size = float(position.get("szi", 0))
+            if size == 0:
+                continue
+            
+            side = "LONG" if size > 0 else "SHORT"
+            
+            # Check if this side should have SL
+            if not self._should_apply_stop_loss(side):
+                skipped.append({"coin": coin, "reason": f"Side {side} not configured"})
+                continue
+            
+            # Get entry price
+            entry_px = float(position.get("entryPx", 0))
+            if entry_px <= 0:
+                skipped.append({"coin": coin, "reason": "Invalid entry price"})
+                continue
+            
+            # Calculate trigger price
+            stop_pct = self.config.portfolio.stop_loss.pct
+            if side == "LONG":
+                trigger_px = entry_px * (1 - stop_pct)
+                is_buy = False  # SL on long = sell
+            else:  # SHORT
+                trigger_px = entry_px * (1 + stop_pct)
+                is_buy = True  # SL on short = buy
+            
+            # Calculate limit price with slippage
+            slippage = self.config.portfolio.stop_loss.slippage
+            if is_buy:
+                limit_px = trigger_px * (1 + slippage)
+            else:
+                limit_px = trigger_px * (1 - slippage)
+            
+            # Round prices
+            trigger_px = self._round_price_perp(coin, trigger_px)
+            limit_px = self._round_price_perp(coin, limit_px)
+            
+            # Round size
+            rounded = self._round_size(coin, abs(size))
+            if rounded is None:
+                skipped.append({"coin": coin, "reason": "Unknown szDecimals"})
+                continue
+            sl_size, _ = rounded
+            
+            # Build SL order
+            sl_order = {
+                "coin": coin,
+                "is_buy": is_buy,
+                "sz": sl_size,
+                "limit_px": limit_px,
+                "order_type": {
+                    "trigger": {
+                        "isMarket": False,  # Use limit for custom slippage
+                        "triggerPx": trigger_px,  # SDK handles string conversion
+                        "tpsl": "sl"
+                    }
+                },
+                "reduce_only": True,
+            }
+            
+            orders_to_place.append(sl_order)
+            order_metadata.append({
+                "coin": coin,
+                "side": side,
+                "entry_px": entry_px,
+                "trigger_px": trigger_px,
+                "limit_px": limit_px,
+                "size": sl_size
+            })
+        
+        # Place all orders in one batch
+        if orders_to_place:
+            self.callbacks.info(f"Placing {len(orders_to_place)} stop loss order(s) in batch...")
+            
+            try:
+                result = self.exchange.bulk_orders(orders_to_place)
+                
+                if result.get("status") == "ok":
+                    # Process response statuses
+                    response = result.get("response", {})
+                    statuses = response.get("data", {}).get("statuses", [])
+                    
+                    for i, status in enumerate(statuses):
+                        if i >= len(order_metadata):
+                            break
+                        
+                        metadata = order_metadata[i]
+                        
+                        if "resting" in status:
+                            # SL order successfully placed
+                            applied.append(metadata)
+                        elif "error" in status:
+                            errors.append({
+                                "coin": metadata["coin"],
+                                "error": status["error"]
+                            })
+                        else:
+                            # Unexpected status
+                            errors.append({
+                                "coin": metadata["coin"],
+                                "error": f"Unexpected status: {status}"
+                            })
+                else:
+                    # Bulk operation failed entirely
+                    for metadata in order_metadata:
+                        errors.append({
+                            "coin": metadata["coin"],
+                            "error": result.get("response", "Bulk operation failed")
+                        })
+            except Exception as e:
+                # Exception during bulk operation
+                for metadata in order_metadata:
+                    errors.append({
+                        "coin": metadata["coin"],
+                        "error": str(e)
+                    })
+        
+        return {
+            "status": "ok",
+            "applied": applied,
+            "skipped": skipped,
+            "errors": errors,
+            "total_applied": len(applied),
+            "total_skipped": len(skipped),
+            "total_errors": len(errors)
+        }
 
     def _load_predictions(self) -> pl.DataFrame | None:
         """Load predictions based on configured data source."""

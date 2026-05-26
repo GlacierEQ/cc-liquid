@@ -1,31 +1,46 @@
 """Command-line interface for cc-liquid."""
 
 import os
+import yaml
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import subprocess
 import shutil
 import shlex
 
 import click
 from rich.console import Console
-from rich.live import Live
+from rich.progress import (
+    Progress,
+    BarColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TimeElapsedColumn,
+    MofNCompleteColumn,
+)
 from typing import Any
 
 from .cli_callbacks import RichCLICallbacks
 from .cli_display import (
     create_dashboard_layout,
     create_config_panel,
+    create_header_panel,
+    create_setup_welcome_panel,
+    create_setup_summary_panel,
     display_portfolio,
     display_file_summary,
+    display_backtest_summary,
     show_pre_alpha_warning,
+    display_optimization_results,
+    display_optimization_contours,
 )
-from .config import apply_cli_overrides, config
+from .backtester import BacktestOptimizer, BacktestConfig, Backtester
+from .config import config
+from .config import apply_cli_overrides
 from .data_loader import DataLoader
 from .trader import CCLiquid
 from .completion import detect_shell_from_env, install_completion
-import yaml
 
 
 TMUX_SESSION_NAME = "cc-liquid"
@@ -53,8 +68,6 @@ def init_cmd(non_interactive: bool):
     """
     console = Console()
     from rich.prompt import Prompt, Confirm
-    from rich.panel import Panel
-    from rich.text import Text
 
     # Check existing files
     cfg_path = "cc-liquid-config.yaml"
@@ -89,14 +102,7 @@ def init_cmd(non_interactive: bool):
         leverage = 1.0
     else:
         # Interactive flow
-        welcome_text = Text.from_markup(
-            "[bold cyan]Welcome to cc-liquid setup![/bold cyan]\n\n"
-            "This wizard will help you create:\n"
-            "• [cyan].env[/cyan] - for your private keys (never commit!)\n"
-            "• [cyan]cc-liquid-config.yaml[/cyan] - for your trading configuration\n\n"
-            "[dim]Press Ctrl+C anytime to cancel[/dim]"
-        )
-        console.print(Panel(welcome_text, title="Setup Wizard", border_style="cyan"))
+        console.print(create_setup_welcome_panel())
 
         # Step 1: Environment
         console.print("\n[bold]Step 1: Choose Environment[/bold]")
@@ -192,13 +198,13 @@ def init_cmd(non_interactive: bool):
                 {
                     "date_column": "date",
                     "asset_id_column": "symbol",
-                    "prediction_column": "meta_model",
+                    "prediction_column": "prediction",
                 }
                 if data_source == "numerai"
                 else {
                     "date_column": "release_date",
                     "asset_id_column": "id",
-                    "prediction_column": "pred_10d",
+                    "prediction_column": "pred_30d",
                 }
             ),
         },
@@ -250,21 +256,12 @@ def init_cmd(non_interactive: bool):
             console.print("[green]✓[/green] Added .env to .gitignore")
 
     # Summary and next steps
-    summary = Panel(
-        Text.from_markup(
-            f"[bold green]✅ Setup Complete![/bold green]\n\n"
-            f"Environment: [cyan]{'TESTNET' if is_testnet else 'MAINNET'}[/cyan]\n"
-            f"Data source: [cyan]{data_source}[/cyan]\n"
-            f"Portfolio: [green]{num_long}L[/green] / [red]{num_short}S[/red] @ [yellow]{leverage}x[/yellow]\n\n"
-            "[bold]Next steps:[/bold]\n"
-            "1. Fill in any missing values in [cyan].env[/cyan]\n"
-            "2. Test connection: [cyan]cc-liquid account[/cyan]\n"
-            "3. View config: [cyan]cc-liquid config[/cyan]\n"
-            "4. First rebalance: [cyan]cc-liquid rebalance[/cyan]\n\n"
-            "[dim]Optional: Install tab completion with 'cc-liquid completion install'[/dim]"
-        ),
-        title="🎉 Ready to Trade",
-        border_style="green",
+    summary = create_setup_summary_panel(
+        is_testnet=is_testnet,
+        data_source=data_source,
+        num_long=num_long,
+        num_short=num_short,
+        leverage=leverage,
     )
     console.print("\n")
     console.print(summary)
@@ -443,9 +440,353 @@ def account():
 
     # Get structured portfolio info
     portfolio = trader.get_portfolio_info()
+    
+    # Get open orders
+    open_orders = trader.get_open_orders()
 
-    # Display using reusable display function with config
-    display_portfolio(portfolio, console, config.to_dict())
+    # Display using reusable display function with config and open orders
+    display_portfolio(portfolio, console, config.to_dict(), open_orders=open_orders)
+
+
+@cli.command()
+def orders():
+    """Show current open orders."""
+    console = Console()
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        open_orders = trader.get_open_orders()
+
+        if not open_orders:
+            console.print("[yellow]No open orders[/yellow]")
+            return
+
+        from rich.table import Table
+
+        table = Table(title="Open Orders", show_header=True, header_style="bold cyan")
+        table.add_column("OID", style="dim")
+        table.add_column("COIN", style="cyan")
+        table.add_column("SIDE", justify="center")
+        table.add_column("SIZE", justify="right")
+        table.add_column("LIMIT PX", justify="right")
+        table.add_column("TIMESTAMP", justify="right")
+
+        for order in open_orders:
+            side = "BUY" if order["side"] == "B" else "SELL"
+            side_style = "green" if side == "BUY" else "red"
+            timestamp = datetime.fromtimestamp(order["timestamp"] / 1000).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            table.add_row(
+                str(order["oid"]),
+                order["coin"],
+                f"[{side_style}]{side}[/{side_style}]",
+                order["sz"],
+                f"${float(order['limitPx']):,.2f}",
+                timestamp,
+            )
+
+        console.print(table)
+        console.print(f"\n[cyan]Total open orders: {len(open_orders)}[/cyan]")
+
+    except Exception as e:
+        console.print(f"[red]✗ Error fetching orders:[/red] {e}")
+        raise
+
+
+@cli.command(name="cancel-orders")
+@click.option("--coin", help="Cancel orders for specific coin only")
+@click.option("--skip-confirm", is_flag=True, help="Skip confirmation prompt")
+def cancel_orders(coin, skip_confirm):
+    """Cancel open orders."""
+    console = Console()
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        # Get open orders first
+        open_orders = trader.get_open_orders()
+
+        if not open_orders:
+            console.print("[yellow]No open orders to cancel[/yellow]")
+            return
+
+        # Filter by coin if specified
+        if coin:
+            orders_to_show = [o for o in open_orders if o["coin"] == coin]
+            if not orders_to_show:
+                console.print(f"[yellow]No open orders found for {coin}[/yellow]")
+                return
+        else:
+            orders_to_show = open_orders
+
+        # Show orders to be cancelled
+        from rich.table import Table
+
+        table = Table(title="Orders to Cancel", show_header=True, header_style="bold yellow")
+        table.add_column("COIN", style="cyan")
+        table.add_column("SIDE", justify="center")
+        table.add_column("SIZE", justify="right")
+        table.add_column("LIMIT PX", justify="right")
+
+        for order in orders_to_show:
+            side = "BUY" if order["side"] == "B" else "SELL"
+            side_style = "green" if side == "BUY" else "red"
+
+            table.add_row(
+                order["coin"],
+                f"[{side_style}]{side}[/{side_style}]",
+                order["sz"],
+                f"${float(order['limitPx']):,.2f}",
+            )
+
+        console.print(table)
+
+        # Confirm cancellation
+        if not skip_confirm:
+            from rich.prompt import Confirm
+
+            if not Confirm.ask(
+                f"\n[bold yellow]Cancel {len(orders_to_show)} order(s)?[/bold yellow]"
+            ):
+                console.print("[yellow]Cancelled by user[/yellow]")
+                return
+
+        # Execute cancellation
+        result = trader.cancel_open_orders(coin)
+
+        if result.get("status") == "ok":
+            console.print(f"[green]✓ Cancelled {len(orders_to_show)} order(s)[/green]")
+        else:
+            console.print(f"[red]✗ Error cancelling orders:[/red] {result}")
+
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}")
+        raise
+
+
+@cli.command()
+def vintages():
+    """Show active vintages in rolling rebalance mode.
+
+    Displays the "layers" of the portfolio - each vintage represents
+    positions opened on a specific date that will expire after rolling_days.
+    """
+    console = Console()
+
+    # Check if rolling mode is configured
+    if config.portfolio.rebalancing.mode != "rolling":
+        console.print(
+            "[yellow]Rolling mode is not enabled. "
+            "Set portfolio.rebalancing.mode=rolling in config.[/yellow]"
+        )
+        return
+
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        summary = trader.get_vintages_summary()
+
+        if not summary:
+            console.print(
+                "[yellow]No active vintages. Run 'cc-liquid rebalance' first.[/yellow]"
+            )
+            return
+
+        from rich.table import Table
+
+        rolling_days = config.portfolio.rebalancing.rolling_days
+
+        table = Table(
+            title=f"Active Vintages ({rolling_days}-day rolling)",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Birth Date", style="cyan")
+        table.add_column("Age", justify="right")
+        table.add_column("Expires In", justify="right")
+        table.add_column("Positions", justify="right")
+        table.add_column("Value", justify="right")
+
+        total_value = 0.0
+        for v in summary:
+            age_str = f"{v['age_days']}d"
+            expires_str = f"{v['expires_in_days']}d"
+            if v["expires_in_days"] <= 1:
+                expires_str = f"[yellow]{expires_str}[/yellow]"
+
+            table.add_row(
+                v["date"],
+                age_str,
+                expires_str,
+                str(v["num_positions"]),
+                f"${v['value_usd']:,.2f}",
+            )
+            total_value += v["value_usd"]
+
+        console.print(table)
+        console.print(f"\n[cyan]Total vintage value: ${total_value:,.2f}[/cyan]")
+        console.print(f"[dim]Active vintages: {len(summary)} of {rolling_days}[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}")
+        raise
+
+
+@cli.command()
+@click.option("--days", type=int, help="Show fills from last N days")
+@click.option("--start", help="Start date (YYYY-MM-DD)")
+@click.option("--end", help="End date (YYYY-MM-DD)")
+@click.option("--limit", type=int, default=50, help="Max number of fills to show")
+def history(days, start, end, limit):
+    """Show trade fill history."""
+    console = Console()
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        # Calculate time range
+        start_time = None
+        end_time = None
+
+        if days:
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=days)
+            start_time = int(start_dt.timestamp() * 1000)
+            end_time = int(end_dt.timestamp() * 1000)
+        elif start:
+            start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            start_time = int(start_dt.timestamp() * 1000)
+            if end:
+                end_dt = datetime.strptime(end, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+                end_time = int(end_dt.timestamp() * 1000)
+
+        # Get fills
+        fills = trader.get_fill_history(start_time, end_time)
+
+        if not fills:
+            console.print("[yellow]No fills found[/yellow]")
+            return
+
+        # Sort by time (most recent first) but don't limit yet
+        all_fills = sorted(fills, key=lambda x: x["time"], reverse=True)
+        total_fills = len(all_fills)
+
+        from rich.table import Table
+
+        # Get fee summary for rate calculation (for estimation comparison)
+        fee_info = trader.get_fee_summary()
+        taker_rate = float(fee_info.get("userCrossRate", 0.00035))
+
+        # Calculate aggregate statistics from ALL fills
+        actual_total_fees = 0.0
+        estimated_total_fees = 0.0
+        total_volume = 0.0
+        missing_fee_count = 0
+
+        for fill in all_fills:
+            size = float(fill["sz"])
+            price = float(fill["px"])
+            value = size * price
+            total_volume += value
+
+            # Actual fee from API
+            actual_fee = float(fill.get("fee", 0))
+            if actual_fee == 0 and "fee" not in fill:
+                missing_fee_count += 1
+            actual_total_fees += actual_fee
+
+            # Estimated fee for comparison
+            estimated_fee = value * taker_rate
+            estimated_total_fees += estimated_fee
+
+        # Now limit fills for display
+        fills_to_display = all_fills[:limit]
+
+        # Build display table with new columns
+        table = Table(title="Fill History", show_header=True, header_style="bold cyan")
+        table.add_column("TIME", style="dim", width=11)
+        table.add_column("COIN", style="cyan", width=8)
+        table.add_column("SIDE", justify="center", width=4)
+        table.add_column("DIR", justify="left", width=11)
+        table.add_column("SIZE", justify="right", width=10)
+        table.add_column("PRICE", justify="right", width=10)
+        table.add_column("VALUE", justify="right", width=11)
+        table.add_column("FEE", justify="right", width=8)
+        table.add_column("PNL", justify="right", width=10)
+        table.add_column("OID", style="dim", justify="right", width=10)
+
+        for fill in fills_to_display:
+            side = fill["side"]
+            side_style = "green" if side == "B" else "red"
+            timestamp = datetime.fromtimestamp(fill["time"] / 1000).strftime(
+                "%m-%d %H:%M"
+            )
+
+            size = float(fill["sz"])
+            price = float(fill["px"])
+            value = size * price
+
+            # Use actual fee from API
+            actual_fee = float(fill.get("fee", 0))
+
+            # Get direction (e.g., "Open Long", "Close Short")
+            direction = fill.get("dir", "-")
+
+            # Get order ID
+            oid = fill.get("oid", "-")
+            if oid != "-":
+                # Truncate long OIDs for display
+                oid = str(oid)[:10] if len(str(oid)) > 10 else str(oid)
+
+            pnl = float(fill.get("closedPnl", 0))
+            pnl_style = "green" if pnl >= 0 else "red"
+
+            table.add_row(
+                timestamp,
+                fill["coin"],
+                f"[{side_style}]{side}[/{side_style}]",
+                direction,
+                f"{size:.4f}",
+                f"${price:,.2f}",
+                f"${value:,.2f}",
+                f"${actual_fee:.2f}",
+                f"[{pnl_style}]${pnl:+,.2f}[/{pnl_style}]" if pnl != 0 else "-",
+                oid,
+            )
+
+        console.print(table)
+
+        # Build summary message
+        if total_fills > limit:
+            summary_prefix = f"Showing {len(fills_to_display)} of {total_fills} fills (use --limit to show more)"
+        else:
+            summary_prefix = f"Showing all {total_fills} fills"
+
+        # Show both actual and estimated fees for validation
+        if actual_total_fees > 0:
+            fee_diff_pct = abs(actual_total_fees - estimated_total_fees) / actual_total_fees * 100
+            fee_summary = (
+                f"Actual fees: ${actual_total_fees:,.2f}  │  "
+                f"Estimated: ${estimated_total_fees:,.2f} ({fee_diff_pct:.2f}% diff)"
+            )
+        else:
+            # Fallback to estimated if no actual fees available
+            fee_summary = f"Estimated fees: ${estimated_total_fees:,.2f}"
+            if missing_fee_count > 0:
+                console.print(
+                    f"[yellow]⚠️  Warning: {missing_fee_count}/{total_fills} fills missing 'fee' field, using estimation[/yellow]"
+                )
+
+        console.print(
+            f"\n[cyan]{summary_prefix}[/cyan]\n"
+            f"[cyan]Total volume: ${total_volume:,.2f}  │  {fee_summary}[/cyan]"
+        )
+
+    except Exception as e:
+        console.print(f"[red]✗ Error fetching history:[/red] {e}")
+        raise
 
 
 @cli.command()
@@ -563,9 +904,13 @@ def close_all(skip_confirm, set_overrides, force):
     multiple=True,
     help="Override config values (e.g., --set data.source=numerai --set portfolio.num_long=10)",
 )
-def rebalance(skip_confirm, set_overrides):
+@click.option(
+    "--cancel-open-orders",
+    is_flag=True,
+    help="Cancel all open orders before rebalancing (useful with Gtc orders).",
+)
+def rebalance(skip_confirm, set_overrides, cancel_open_orders):
     """Execute rebalancing based on the configured data source."""
-    Console()
 
     # Apply CLI overrides to config
     overrides_applied = apply_cli_overrides(config, set_overrides)
@@ -577,8 +922,42 @@ def rebalance(skip_confirm, set_overrides):
     # Show applied overrides through callbacks
     callbacks.on_config_override(overrides_applied)
 
-    # Preview plan first (no execution)
-    plan = trader.plan_rebalance()
+    # Handle open orders before planning
+    if cancel_open_orders:
+        # Auto-cancel if flag is set
+        open_orders = trader.get_open_orders()
+        if open_orders:
+            callbacks.info(f"Cancelling {len(open_orders)} open order(s)...")
+            result = trader.cancel_open_orders()
+            if result.get("status") == "ok":
+                callbacks.info(f"✓ Cancelled {len(open_orders)} order(s)")
+            else:
+                callbacks.warn(f"Failed to cancel orders: {result}")
+        else:
+            callbacks.info("No open orders to cancel")
+
+    # Preview plan first (no execution) - dispatch based on mode
+    plan = trader.plan_rebalance_auto()
+
+    # Check for open orders if not already cancelled
+    if not cancel_open_orders and plan.get("open_orders"):
+        from rich.prompt import Confirm
+        console = Console()
+        
+        open_orders = plan["open_orders"]
+        console.print(
+            f"\n[bold yellow]⚠️  Found {len(open_orders)} open order(s) that may conflict with rebalancing[/bold yellow]"
+        )
+        
+        if Confirm.ask("Cancel open orders before proceeding?", default=False):
+            callbacks.info(f"Cancelling {len(open_orders)} open order(s)...")
+            result = trader.cancel_open_orders()
+            if result.get("status") == "ok":
+                callbacks.info(f"✓ Cancelled {len(open_orders)} order(s)")
+                # Re-plan after cancelling orders
+                plan = trader.plan_rebalance_auto()
+            else:
+                callbacks.warn(f"Failed to cancel orders: {result}")
 
     # Render plan via callbacks
     all_trades = plan["trades"] + plan["skipped_trades"]
@@ -597,6 +976,573 @@ def rebalance(skip_confirm, set_overrides):
         )
     else:
         callbacks.info("Trading cancelled by user")
+
+
+@cli.command(name="apply-stops")
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Override config values (e.g., --set portfolio.stop_loss.sides=both)",
+)
+def apply_stops(set_overrides):
+    """Manually apply stop losses to all open positions.
+    
+    Useful after:
+    - Limit orders fill (were resting on book during rebalance)
+    - Manual trades outside the bot
+    - Bot restart with existing positions
+    - Changing stop loss configuration
+    """
+    console = Console()
+    
+    # Apply CLI overrides
+    overrides_applied = apply_cli_overrides(config, set_overrides)
+    
+    # Create trader
+    callbacks = RichCLICallbacks()
+    trader = CCLiquid(config, callbacks=callbacks)
+    
+    # Show overrides
+    callbacks.on_config_override(overrides_applied)
+    
+    try:
+        # Show what we're doing
+        console.print("\n[cyan]Applying stop losses to open positions...[/cyan]")
+        
+        # Apply stop losses
+        result = trader.apply_stop_losses()
+        
+        # Display results
+        if result.get("status") == "disabled":
+            console.print(f"[yellow]{result['message']}[/yellow]")
+            return
+        
+        applied = result.get("applied", [])
+        skipped = result.get("skipped", [])
+        errors = result.get("errors", [])
+        
+        # Count side-filtered skips vs other skips
+        side_skips = [s for s in skipped if "not configured" in s.get("reason", "")]
+        other_skips = [s for s in skipped if "not configured" not in s.get("reason", "")]
+        
+        # Summary
+        console.print(f"\n[bold cyan]Stop Loss Application Summary[/bold cyan]")
+        console.print(f"[green]✓ Applied: {len(applied)}[/green]")
+        if side_skips:
+            console.print(f"[dim]⊘ Skipped (side filter): {len(side_skips)}[/dim]")
+        if other_skips:
+            console.print(f"[yellow]⊘ Skipped (other): {len(other_skips)}[/yellow]")
+        if errors:
+            console.print(f"[red]✗ Errors: {len(errors)}[/red]")
+        
+        # Details table
+        if applied:
+            from rich.table import Table
+            from .cli_display import format_currency
+            
+            table = Table(title="Applied Stop Losses", show_header=True, header_style="bold cyan")
+            table.add_column("COIN", style="cyan")
+            table.add_column("SIDE", justify="center")
+            table.add_column("ENTRY", justify="right")
+            table.add_column("TRIGGER", justify="right")
+            table.add_column("LIMIT", justify="right")
+            
+            for sl in applied:
+                side_style = "green" if sl["side"] == "LONG" else "red"
+                table.add_row(
+                    sl["coin"],
+                    f"[{side_style}]{sl['side']}[/{side_style}]",
+                    format_currency(sl['entry_px']),
+                    format_currency(sl['trigger_px']),
+                    format_currency(sl['limit_px']),
+                )
+            console.print(table)
+        
+        # Only show non-side-filtered skips (actual issues)
+        if other_skips:
+            console.print("\n[yellow]Skipped positions (issues):[/yellow]")
+            for s in other_skips:
+                console.print(f"  • {s['coin']}: {s['reason']}")
+        
+        if errors:
+            console.print("\n[red]Errors:[/red]")
+            for e in errors:
+                console.print(f"  • {e['coin']}: {e['error']}")
+                
+    except Exception as e:
+        console.print(f"[red]✗ Error applying stop losses:[/red] {e}")
+        raise
+
+
+@cli.command()
+@click.option(
+    "--prices",
+    default="raw_data.parquet",
+    help="Path to price data (parquet file with date, id, close columns)",
+)
+@click.option(
+    "--start-date",
+    type=click.DateTime(),
+    help="Start date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--end-date",
+    type=click.DateTime(),
+    help="End date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Override config values (e.g., --set portfolio.num_long=15 --set data.source=numerai)",
+)
+@click.option(
+    "--fee-bps",
+    type=float,
+    default=4.0,
+    help="Trading fee in basis points",
+)
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=50.0,
+    help="Slippage cost in basis points",
+)
+@click.option(
+    "--prediction-lag",
+    type=int,
+    default=1,
+    help="Days between prediction date and trading date (default: 1, use higher values to avoid look-ahead bias)",
+)
+@click.option(
+    "--save-daily",
+    help="Save daily results to CSV file",
+)
+@click.option(
+    "--show-positions",
+    is_flag=True,
+    help="Show detailed position analysis table",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Show detailed progress",
+)
+def analyze(
+    prices,
+    start_date,
+    end_date,
+    set_overrides,
+    fee_bps,
+    slippage_bps,
+    prediction_lag,
+    save_daily,
+    show_positions,
+    verbose,
+):
+    """Run backtest analysis on historical data.
+
+    ⚠️ IMPORTANT DISCLAIMER:
+    Past performance does not guarantee future results. Backtesting results are
+    hypothetical and have inherent limitations. Actual trading results may differ
+    significantly. Always consider market conditions, liquidity, and execution costs
+    that may not be fully captured in simulations.
+    """
+    from .backtester import Backtester, BacktestConfig
+    from .config import config
+
+    console = Console()
+
+    # Apply CLI overrides to config (includes smart defaults for data.source changes)
+    overrides_applied = apply_cli_overrides(config, set_overrides)
+
+    # Show applied overrides through console
+    if overrides_applied:
+        console.print("[cyan]Configuration overrides applied:[/cyan]")
+        for override in overrides_applied:
+            console.print(f"  • {override}")
+        console.print()
+
+    # Now use the config value (which may have been overridden)
+    predictions = config.data.path
+
+    # Determine effective mode and rolling days
+    if config.portfolio.rebalancing.mode == "rolling":
+        console.print(f"[cyan]Using rolling mode with {config.portfolio.rebalancing.rolling_days}-day vintages[/cyan]\n")
+
+    # Create backtest config using the updated config values
+    bt_config = BacktestConfig(
+        prices_path=prices,
+        predictions_path=predictions,
+        # Use config columns for predictions
+        pred_date_column=config.data.date_column,
+        pred_id_column=config.data.asset_id_column,
+        pred_value_column=config.data.prediction_column,
+        data_provider=config.data.source,
+        start_date=start_date,
+        end_date=end_date,
+        num_long=config.portfolio.num_long,
+        num_short=config.portfolio.num_short,
+        target_leverage=config.portfolio.target_leverage,
+        rank_power=config.portfolio.rank_power,
+        rebalance_every_n_days=config.portfolio.rebalancing.every_n_days,
+        prediction_lag_days=prediction_lag,
+        mode=config.portfolio.rebalancing.mode,
+        rolling_days=config.portfolio.rebalancing.rolling_days,
+        seed_full=config.portfolio.rebalancing.seed_full,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        verbose=verbose,
+    )
+
+    try:
+        # Run backtest with spinner
+        from rich.spinner import Spinner
+        from rich.live import Live
+
+        with Live(
+            Spinner("dots", text="Running backtest..."), console=console, transient=True
+        ):
+            backtester = Backtester(bt_config)
+            result = backtester.run()
+
+        display_backtest_summary(
+            console, result, bt_config, show_positions=show_positions
+        )
+
+        # Save daily results if requested
+        if save_daily:
+            result.daily.write_csv(save_daily)
+            console.print(f"\n[green]✓[/green] Saved daily results to {save_daily}")
+
+    except Exception as e:
+        from rich.markup import escape
+
+        console.print(f"[red]✗ Backtest failed: {escape(str(e))}[/red]")
+        if verbose:
+            import traceback
+
+            traceback.print_exc()
+
+
+@cli.command()
+@click.option(
+    "--prices",
+    default="raw_data.parquet",
+    help="Path to price data",
+)
+@click.option(
+    "--start-date",
+    type=click.DateTime(),
+    help="Start date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--end-date",
+    type=click.DateTime(),
+    help="End date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Override config values (e.g., --set data.source=numerai)",
+)
+@click.option(
+    "--num-longs",
+    default="10,20,30,40,50",
+    help="Comma-separated list of long positions to test",
+)
+@click.option(
+    "--num-shorts",
+    default="10,20,30,40,50",
+    help="Comma-separated list of short positions to test",
+)
+@click.option(
+    "--leverages",
+    default="1.0,2.0,3.0,4.0,5.0",
+    help="Comma-separated list of leverage values to test",
+)
+@click.option(
+    "--rebalance-days",
+    default="8,10,12",
+    help="Comma-separated list of rebalance frequencies to test",
+)
+@click.option(
+    "--rank-powers",
+    default="0.0,0.5,1.0,1.5,2.0",
+    help="Comma-separated list of rank power values to test (0=equal weight)",
+)
+@click.option(
+    "--metric",
+    type=click.Choice(["sharpe", "cagr", "calmar"]),
+    default="sharpe",
+    help="Optimization metric",
+)
+@click.option(
+    "--max-drawdown",
+    type=float,
+    help="Maximum drawdown constraint (e.g., 0.2 for 20%)",
+)
+@click.option(
+    "--fee-bps",
+    type=float,
+    default=4.0,
+    help="Trading fee in basis points",
+)
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=50.0,
+    help="Slippage cost in basis points",
+)
+@click.option(
+    "--prediction-lag",
+    type=int,
+    default=1,
+    help="Days between prediction date and trading date (default: 1, use higher values to avoid look-ahead bias)",
+)
+@click.option(
+    "--top-n",
+    type=int,
+    default=20,
+    help="Show top N results",
+)
+@click.option(
+    "--apply-best",
+    is_flag=True,
+    help="Run full analysis with best parameters",
+)
+@click.option(
+    "--save-results",
+    help="Save optimization results to CSV",
+)
+@click.option(
+    "--plot",
+    is_flag=True,
+    help="Show contour plots of results",
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    help="Number of parallel workers (default: auto)",
+)
+@click.option(
+    "--clear-cache",
+    is_flag=True,
+    help="Clear cached optimization results",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Show detailed progress",
+)
+def optimize(
+    prices,
+    start_date,
+    end_date,
+    set_overrides,
+    num_longs,
+    num_shorts,
+    leverages,
+    rebalance_days,
+    rank_powers,
+    metric,
+    max_drawdown,
+    fee_bps,
+    slippage_bps,
+    prediction_lag,
+    top_n,
+    apply_best,
+    save_results,
+    plot,
+    max_workers,
+    clear_cache,
+    verbose,
+):
+    """Optimize backtest parameters using parallel grid search.
+
+    ⚠️ IMPORTANT DISCLAIMER:
+    Optimization results are based on historical data and are subject to overfitting.
+    Parameters that performed well in the past may not perform well in the future.
+    Always use out-of-sample testing and forward walk analysis. Consider that
+    optimized parameters may be curve-fit to historical noise rather than true patterns.
+    """
+    console = Console()
+
+    # Apply CLI overrides to config (includes smart defaults for data.source changes)
+    overrides_applied = apply_cli_overrides(config, set_overrides)
+
+    # Show applied overrides through console
+    if overrides_applied:
+        console.print("[cyan]Configuration overrides applied:[/cyan]")
+        for override in overrides_applied:
+            console.print(f"  • {override}")
+        console.print()
+
+    # Parse parameter lists
+    num_longs_list = [int(x.strip()) for x in num_longs.split(",")]
+    num_shorts_list = [int(x.strip()) for x in num_shorts.split(",")]
+    leverages_list = [float(x.strip()) for x in leverages.split(",")]
+    rebalance_days_list = [int(x.strip()) for x in rebalance_days.split(",")]
+    rank_powers_list = [float(x.strip()) for x in rank_powers.split(",")]
+
+    # Now use the config value (which may have been overridden)
+    predictions = config.data.path
+
+    # Create base config with all parameters
+    base_config = BacktestConfig(
+        prices_path=prices,
+        predictions_path=predictions,
+        pred_date_column=config.data.date_column,
+        pred_id_column=config.data.asset_id_column,
+        pred_value_column=config.data.prediction_column,
+        data_provider=config.data.source,
+        start_date=start_date,
+        end_date=end_date,
+        rank_power=config.portfolio.rank_power,
+        prediction_lag_days=prediction_lag,
+        mode=config.portfolio.rebalancing.mode,
+        rolling_days=config.portfolio.rebalancing.rolling_days,
+        seed_full=config.portfolio.rebalancing.seed_full,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        verbose=verbose,
+    )
+
+    try:
+        # Calculate total combinations
+        total_combos = (
+            len(num_longs_list)
+            * len(num_shorts_list)
+            * len(leverages_list)
+            * len(rebalance_days_list)
+        )
+
+        # Create optimizer
+        optimizer = BacktestOptimizer(base_config)
+
+        # Clear cache if requested
+        if clear_cache:
+            optimizer.clear_cache()
+            console.print("[yellow]Cache cleared[/yellow]\n")
+
+        # Show optimization header
+        header = create_header_panel(f"OPTIMIZATION :: {total_combos} COMBINATIONS")
+        console.print(header)
+        console.print(f"\nOptimizing for: [bold yellow]{metric.upper()}[/bold yellow]")
+        if max_drawdown:
+            console.print(
+                f"Max drawdown constraint: [yellow]{max_drawdown:.1%}[/yellow]"
+            )
+        console.print(
+            f"Parameters: L={num_longs_list} S={num_shorts_list} Lev={leverages_list} Days={rebalance_days_list} Power={rank_powers_list}"
+        )
+
+        if max_workers:
+            console.print(f"Parallel workers: [cyan]{max_workers}[/cyan]")
+        else:
+            import multiprocessing as mp
+
+            auto_workers = min(mp.cpu_count(), 24)
+            console.print(f"Parallel workers: [cyan]{auto_workers}[/cyan] (auto)")
+        console.print()
+
+        # Run optimization with Rich Progress
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            expand=False,
+        ) as progress:
+            # Run parallel optimization
+            results_df = optimizer.grid_search_parallel(
+                num_longs=num_longs_list,
+                num_shorts=num_shorts_list,
+                leverages=leverages_list,
+                rebalance_days=rebalance_days_list,
+                rank_powers=rank_powers_list,
+                metric=metric,
+                max_drawdown_limit=max_drawdown,
+                max_workers=max_workers,
+                progress_callback=progress,
+            )
+
+        if len(results_df) == 0:
+            console.print("[red]No valid results found[/red]")
+            return
+
+        # Display results
+        console.print()  # Space after progress
+        display_optimization_results(console, results_df, metric, top_n, base_config)
+
+        # Show contour plots if requested
+        if plot:
+            display_optimization_contours(console, results_df, metric)
+
+        # Save results if requested
+        if save_results:
+            results_df.write_csv(save_results)
+            console.print(f"\n[green]✓[/green] Saved results to {save_results}")
+
+        # Apply best parameters if requested
+        if apply_best:
+            best_params = optimizer.get_best_params(results_df, metric)
+            if best_params:
+                console.print(
+                    "\n[bold cyan]Running full analysis with best parameters...[/bold cyan]"
+                )
+                console.print(
+                    f"Best params: L={best_params['num_long']}, S={best_params['num_short']}, "
+                    f"Lev={best_params['target_leverage']:.1f}x, Days={best_params['rebalance_every_n_days']}, "
+                    f"Power={best_params['rank_power']}"
+                )
+
+                # Create config with best params and all other settings
+                best_config = BacktestConfig(
+                    prices_path=prices,
+                    predictions_path=predictions,
+                    pred_date_column=config.data.date_column,
+                    pred_id_column=config.data.asset_id_column,
+                    pred_value_column=config.data.prediction_column,
+                    data_provider=config.data.source,
+                    start_date=start_date,
+                    end_date=end_date,
+                    num_long=best_params["num_long"],
+                    num_short=best_params["num_short"],
+                    target_leverage=best_params["target_leverage"],
+                    rebalance_every_n_days=best_params["rebalance_every_n_days"],
+                    rank_power=best_params["rank_power"],
+                    prediction_lag_days=prediction_lag,
+                    mode=config.portfolio.rebalancing.mode,
+                    rolling_days=config.portfolio.rebalancing.rolling_days,
+                    seed_full=config.portfolio.rebalancing.seed_full,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    verbose=False,
+                )
+
+                # Run backtest
+                backtester = Backtester(best_config)
+                result = backtester.run()
+
+                display_backtest_summary(
+                    console, result, best_config, show_positions=False
+                )
+
+    except Exception as e:
+        from rich.markup import escape
+
+        console.print(f"[red]✗ Optimization failed: {escape(str(e))}[/red]")
+        if verbose:
+            import traceback
+
+            traceback.print_exc()
 
 
 @cli.command()
@@ -725,6 +1671,7 @@ def run_live_cli(
     # converts seconds per refresh to Live's refresh-per-second value
     live_rps = 1.0 / refresh_seconds if refresh_seconds > 0 else 1.0
     from rich.spinner import Spinner
+    from rich.live import Live
 
     spinner = Spinner("dots", text="Loading...")
     with Live(
@@ -739,6 +1686,9 @@ def run_live_cli(
             while True:
                 # Get current portfolio state
                 portfolio = trader.get_portfolio_info()
+                
+                # Get open orders
+                open_orders = trader.get_open_orders()
 
                 # Calculate next rebalance time and determine if due
                 next_action_time = trader.compute_next_rebalance_time(
@@ -756,7 +1706,7 @@ def run_live_cli(
                             "\n[bold yellow]-- Scheduled rebalance started --[/bold yellow]"
                         )
                         # Preview plan
-                        plan = trader.plan_rebalance()
+                        plan = trader.plan_rebalance_auto()
                         all_trades = plan["trades"] + plan["skipped_trades"]
                         callbacks.show_trade_plan(
                             plan["target_positions"],
@@ -783,18 +1733,20 @@ def run_live_cli(
                         last_rebalance_date = datetime.now(timezone.utc)
                         trader.save_state(last_rebalance_date)
 
-                        console.input(
-                            "\n[bold green]✓ Rebalance cycle finished. Press [bold]Enter[/bold] to resume dashboard...[/bold green]"
-                        )
+                        if not skip_confirm:
+                            console.input(
+                                "\n[bold green]✓ Rebalance cycle finished. Press [bold]Enter[/bold] to resume dashboard...[/bold green]"
+                            )
 
                     except Exception as e:
                         console.print(
                             f"\n[bold red]✗ Rebalancing failed:[/bold red] {e}"
                         )
                         traceback.print_exc()
-                        console.input(
-                            "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
-                        )
+                        if not skip_confirm:
+                            console.input(
+                                "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
+                            )
                     finally:
                         # Resume the live dashboard
                         live.start()
@@ -810,6 +1762,7 @@ def run_live_cli(
                         is_rebalancing=False,
                         config_dict=config_obj.to_dict(),
                         refresh_seconds=refresh_seconds,
+                        open_orders=open_orders,
                     )
                     live.update(dashboard)
 
